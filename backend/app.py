@@ -242,7 +242,11 @@ def get_parameter_analysis():
 
 @app.route("/api/export/master", methods=["GET"])
 def export_master():
-    """Export Master_Ocean_Data.xlsx"""
+    """
+    Export Master_Ocean_Data.xlsx
+    Format: Date | Location | Param1 Mean | Param1 StdDev | Param2 Mean | Param2 StdDev | ...
+    Columns are interleaved (Mean + StdDev side by side per parameter).
+    """
     date_from = request.args.get("date_from")
     date_to   = request.args.get("date_to")
     location  = request.args.get("location")
@@ -252,20 +256,30 @@ def export_master():
         return error("No data available for export.")
 
     df = pd.DataFrame(rows)
-    pivoted = df.pivot_table(
-        index=["date", "location"],
-        columns="parameter",
-        values=["mean", "std_dev"],
-        aggfunc="first",
-    )
-    # Rename columns: "pH_mean", "pH_std_dev" etc.
-    pivoted.columns = [f"{param}_{stat}" for stat, param in pivoted.columns]
-    pivoted.reset_index(inplace=True)
-    pivoted.sort_values(["date", "location"], inplace=True)
+
+    # Get sorted parameter list
+    params = sorted(df["parameter"].unique().tolist())
+
+    # Pivot mean and std_dev separately
+    mean_piv = df.pivot_table(index=["date", "location"], columns="parameter", values="mean",   aggfunc="first")
+    std_piv  = df.pivot_table(index=["date", "location"], columns="parameter", values="std_dev", aggfunc="first")
+
+    # Build interleaved column order: Param1 Mean, Param1 StdDev, Param2 Mean, ...
+    result = mean_piv.copy()[[]]  # empty frame with same index
+    for p in params:
+        col_mean = p + " Mean"
+        col_std  = p + " StdDev"
+        result[col_mean] = mean_piv[p] if p in mean_piv.columns else np.nan
+        result[col_std]  = std_piv[p]  if p in std_piv.columns  else np.nan
+
+    result.reset_index(inplace=True)
+    result.sort_values(["date", "location"], inplace=True)
+    result.rename(columns={"date": "Date", "location": "Location"}, inplace=True)
+    result.replace({np.nan: ""}, inplace=True)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pivoted.to_excel(writer, sheet_name="Master Ocean Data", index=False)
+        result.to_excel(writer, sheet_name="All Locations", index=False)
 
     output.seek(0)
     return send_file(
@@ -357,6 +371,75 @@ def export_parameter_stddev():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Analysis-ready export: one sheet per location
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/export/analysis", methods=["GET"])
+def export_analysis():
+    """
+    Export Analysis_Ready.xlsx
+
+    Layout: One sheet per location (+ one combined sheet).
+    Each sheet:
+      Date | Param1 Mean | Param1 StdDev | Param2 Mean | Param2 StdDev | ...
+
+    One row = one day. Just copy-paste into your plotting tool.
+    """
+    date_from = request.args.get("date_from")
+    date_to   = request.args.get("date_to")
+
+    rows = db.get_master_dataset(date_from, date_to)
+    if not rows:
+        return error("No data available for export.")
+
+    df = pd.DataFrame(rows)
+    params    = sorted(df["parameter"].unique().tolist())
+    locations = sorted(df["location"].unique().tolist())
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # ── One sheet per location ────────────────────────────────────────────
+        for loc in locations:
+            loc_df = df[df["location"] == loc]
+            mean_piv = loc_df.pivot_table(index="date", columns="parameter", values="mean",   aggfunc="first")
+            std_piv  = loc_df.pivot_table(index="date", columns="parameter", values="std_dev", aggfunc="first")
+
+            sheet = pd.DataFrame(index=mean_piv.index)
+            for p in params:
+                sheet[p + " Mean"]   = mean_piv[p] if p in mean_piv.columns else np.nan
+                sheet[p + " StdDev"] = std_piv[p]  if p in std_piv.columns  else np.nan
+
+            sheet.reset_index(inplace=True)
+            sheet.rename(columns={"date": "Date"}, inplace=True)
+            sheet.replace({np.nan: ""}, inplace=True)
+
+            # Sheet name max 31 chars (Excel limit)
+            sheet_name = loc[:31]
+            sheet.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # ── Combined sheet: Date | Location | Param1 Mean | Param1 StdDev | … ─
+        mean_piv_all = df.pivot_table(index=["date", "location"], columns="parameter", values="mean",   aggfunc="first")
+        std_piv_all  = df.pivot_table(index=["date", "location"], columns="parameter", values="std_dev", aggfunc="first")
+        combined = pd.DataFrame(index=mean_piv_all.index)
+        for p in params:
+            combined[p + " Mean"]   = mean_piv_all[p] if p in mean_piv_all.columns else np.nan
+            combined[p + " StdDev"] = std_piv_all[p]  if p in std_piv_all.columns  else np.nan
+        combined.reset_index(inplace=True)
+        combined.rename(columns={"date": "Date", "location": "Location"}, inplace=True)
+        combined.replace({np.nan: ""}, inplace=True)
+        combined.to_excel(writer, sheet_name="All Locations", index=False)
+
+    output.seek(0)
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="Analysis_Ready.xlsx",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Delete upload (for testing / corrections)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -375,6 +458,90 @@ def delete_upload(upload_id):
     conn.commit()
     conn.close()
     return success({"message": f"Deleted upload for {location} on {date}."})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Debug: inspect raw file structure (not stored in DB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/debug-parse", methods=["POST"])
+def debug_parse():
+    """
+    Upload one CSV file and get a JSON dump of:
+    - Encoding detected
+    - Delimiter detected
+    - First 25 rows (each as a list of cells)
+    - Which row looks like Mean / StdDev / Header
+    Use this to diagnose parse failures without touching the database.
+    """
+    from parser import decode_file, detect_delimiter, is_mean_row_label, is_std_row_label, is_header_row, safe_float
+    import csv as csv_mod
+
+    files = request.files.getlist("file") or request.files.getlist("files")
+    if not files or not files[0].filename:
+        return error("Upload one file with key 'file'.")
+
+    f    = files[0]
+    raw  = f.read()
+    name = os.path.basename(f.filename)
+
+    # Detect encoding
+    enc_used = "unknown"
+    text = None
+    for enc in ["utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "latin-1"]:
+        try:
+            text = raw.decode(enc)
+            enc_used = enc
+            break
+        except Exception:
+            continue
+
+    if text is None:
+        return error("Could not decode file.")
+
+    # Strip sep= line
+    lines = text.splitlines(keepends=True)
+    had_sep_line = bool(lines and re.match(r"^sep\s*=", lines[0].strip(), re.IGNORECASE))
+    if had_sep_line:
+        text = "".join(lines[1:])
+
+    delimiter = detect_delimiter(text[:5000])
+
+    # Read all rows
+    reader   = csv_mod.reader(io.StringIO(text), delimiter=delimiter)
+    all_rows = list(reader)
+    max_cols = max((len(r) for r in all_rows), default=1)
+
+    # Build annotated rows
+    annotated = []
+    for i, row in enumerate(all_rows[:30]):
+        first   = row[0].strip() if row else ""
+        is_mean = is_mean_row_label(first)
+        is_std  = is_std_row_label(first)
+        is_hdr  = is_header_row(row)
+
+        # Count how many cells are non-empty and non-numeric
+        str_cells = sum(1 for c in row if c.strip() and safe_float(c) is None and len(c.strip()) > 1)
+
+        annotated.append({
+            "row_idx":    i,
+            "cells":      row[:20],            # cap at 20 for readability
+            "num_cells":  len(row),
+            "str_cells":  str_cells,
+            "is_mean":    is_mean,
+            "is_std":     is_std,
+            "is_header":  is_hdr,
+        })
+
+    return success({
+        "filename":       name,
+        "encoding":       enc_used,
+        "delimiter":      repr(delimiter),
+        "had_sep_line":   had_sep_line,
+        "total_rows":     len(all_rows),
+        "max_cols":       max_cols,
+        "rows":           annotated,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
