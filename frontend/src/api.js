@@ -23,6 +23,11 @@ export const exportMaster = (params) => {
   window.open(`/api/export/master?${qs}`, '_blank')
 }
 
+export const exportAnalysis = (params = {}) => {
+  const qs = new URLSearchParams(params).toString()
+  window.open(`/api/export/analysis?${qs}`, '_blank')
+}
+
 export const exportParamMean = (parameter) => {
   window.open(`/api/export/parameter-mean?parameter=${encodeURIComponent(parameter)}`, '_blank')
 }
